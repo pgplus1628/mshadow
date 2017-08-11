@@ -602,7 +602,7 @@ MSHADOW_XINLINE int MinValue<int32_t>(void) {
 }
 /*! \brief minimum value of int64_t */
 template<>
-MSHADOW_XINLINE int MinValue<int64_t>(void) {
+MSHADOW_XINLINE int64_t MinValue<int64_t>(void) {
   return LLONG_MIN;
 }
 /*!
@@ -638,7 +638,7 @@ MSHADOW_XINLINE int MaxValue<int32_t>(void) {
 }
 /*! \brief maximum value of int64_t */
 template<>
-MSHADOW_XINLINE int MaxValue<int64_t>(void) {
+MSHADOW_XINLINE int64_t MaxValue<int64_t>(void) {
   return LLONG_MAX;
 }
 }  // namespace limits

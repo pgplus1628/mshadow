@@ -34,7 +34,7 @@ const int kMemUnit = 1 << kMemUnitBits;
 /*! \brief mask that could be helpful sometime */
 const int kMemUnitMask = kMemUnit - 1;
 /*! \brief suggested thread number(logscale) for mapping kernel */
-const int kBaseThreadBits = 8;
+const int kBaseThreadBits = 8; //(pin) 8
 /*! \brief suggested thread number for mapping kernel */
 const int kBaseThreadNum  = 1 << kBaseThreadBits;
 /*! \brief maximum value of grid */

@@ -487,51 +487,6 @@ inline void VectorDot(Tensor<Device, 1, DType> dst,
       lhs.stream_, lhs.size(0), lhs.dptr_, 1, rhs.dptr_, 1, dst.dptr_);
 }
 
-// (pin) Add gemm
-template<bool transpose_left, bool transpose_right, typename Device, typename DType>
-inline void GEMM(Tensor<Device, 2, DType> dst,
-                      const Tensor<Device, 2, DType> &lhs,
-                      const Tensor<Device, 2, DType> &rhs,
-                      DType alpha,
-                      DType beta) {
-  auto k_left = 0, k_right = 0;
-  auto m = 0, n = 0;
-  if (transpose_left) { 
-    k_left = lhs.size(0);
-    m = lhs.size(1);
-  } else { 
-    k_left = lhs.size(1);
-    m = lhs.size(0);
-  }
-
-  if (transpose_right) { 
-    k_right = rhs.size(1);
-    n = rhs.size(0);
-  } else { 
-    k_right = rhs.size(0);
-    n = rhs.size(1);
-  }
-
-  CHECK_EQ(k_left, k_right)
-      << "GEMM: Shape mismatch";
-  auto k = k_left;
- 
-  CHECK_EQ(dst.size(0), m) << "GEMM: dst sizedim 0 mismatch";
-  CHECK_EQ(dst.size(1), n) << "GEMM: dst sizedim 1 mismatch";
-
-  expr::BLASEngine<Device, DType>::SetStream(dst.stream_);
-  expr::BLASEngine<Device, DType>::gemm
-  (dst.stream_,
-   transpose_left,
-   transpose_right,
-   m, n, k, alpha,
-   lhs.dptr_, lhs.stride_,
-   rhs.dptr_, rhs.stride_, beta,
-   dst.dptr_, dst.stride_);
-}
-
-
-
 template<bool transpose_left, bool transpose_right, typename Device, typename DType>
 inline void BatchGEMM(Tensor<Device, 3, DType> dst,
                       const Tensor<Device, 3, DType> &lhs,

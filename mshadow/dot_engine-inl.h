@@ -14,7 +14,25 @@
 #include "./cuda/tensor_gpu-inl.cuh"
 #endif  // #ifdef __CUDACC__
 
+
 namespace mshadow {
+
+/*
+// (pin) get time
+#include <sys/time.h>
+#include <cstdint>
+#include <stdio.h>
+#include <cstdlib>
+
+inline uint64_t get_time(){
+  struct timeval t;
+  gettimeofday(&t, NULL);
+  return static_cast<uint64_t>(t.tv_sec * 1000000 + t.tv_usec);
+}
+*/
+
+
+
  /*!
 * \brief CPU/GPU: Get a batched view of the src array. dst[i] = src + i * stride
 * \param dst 2D pointer
@@ -760,6 +778,8 @@ struct DotEngine<SV, xpu, 2, 2, 2, transpose_left, transpose_right, DType> {
     CHECK(dst.size(0) == sleft[0] && dst.size(1) == sright[1] && sleft[1] == sright[0])
       << "dot-gemm: matrix shape mismatch";
     // use column major argument to compatible with most BLAS
+    // (pin)
+    //uint64_t t0 = get_time();
     BLASEngine<xpu, DType>::gemm
         (dst.stream_,
          transpose_right , transpose_left,
@@ -771,6 +791,9 @@ struct DotEngine<SV, xpu, 2, 2, 2, transpose_left, transpose_right, DType> {
          lhs.dptr_, lhs.stride_,
          DType(SV::BetaBLAS()),
          dst.dptr_, dst.stride_);
+    //dst.stream_->Wait();
+    //uint64_t t1 = get_time();
+    //printf("cost %ld\n", t1 - t0);
   }
 };
 template<typename SV, typename xpu, bool transpose_right, typename DType>

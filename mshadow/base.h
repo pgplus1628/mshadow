@@ -102,6 +102,13 @@ typedef unsigned __int64 uint64_t;
 #endif
 
 /*!
+ * \brief use CUSOLVER support
+ */
+#ifndef MSHADOW_USE_CUSOLVER
+  #define MSHADOW_USE_CUSOLVER MSHADOW_USE_CUDA
+#endif
+
+/*!
  * \brief seems CUDAARCH is deprecated in future NVCC
  * set this to 1 if you want to use CUDA version smaller than 2.0
  */
@@ -113,8 +120,12 @@ typedef unsigned __int64 uint64_t;
  * \brief macro to decide existence of c++11 compiler
  */
 #ifndef MSHADOW_IN_CXX11
-#define MSHADOW_IN_CXX11 (defined(__GXX_EXPERIMENTAL_CXX0X__) ||\
-                          __cplusplus >= 201103L || defined(_MSC_VER))
+  #if (defined(__GXX_EXPERIMENTAL_CXX0X__) ||\
+      __cplusplus >= 201103L || defined(_MSC_VER))
+    #define MSHADOW_IN_CXX11 1
+  #else
+    #define MSHADOW_IN_CXX11 0
+  #endif
 #endif
 
 /*! \brief whether use SSE */
@@ -150,6 +161,10 @@ extern "C" {
 
 #if MSHADOW_USE_CUDNN == 1
   #include <cudnn.h>
+#endif
+
+#if MSHADOW_USE_CUSOLVER == 1
+  #include <cusolverDn.h>
 #endif
 
 #if MSHADOW_USE_NVML
@@ -189,7 +204,7 @@ extern "C" {
  *  template arguments can be detected
  */
 #ifndef MSHADOW_DEFAULT_DTYPE
-#define MSHADOW_DEFAULT_DTYPE = default_real_t
+#define MSHADOW_DEFAULT_DTYPE = ::mshadow::default_real_t
 #endif
 
 /*!
@@ -205,6 +220,12 @@ extern "C" {
 #else
 #define MSHADOW_THROW_EXCEPTION
 #define MSHADOW_NO_EXCEPTION
+#endif
+
+#if defined(_MSC_VER)
+#define MSHADOW_ALIGNED(x) __declspec(align(x))
+#else
+#define MSHADOW_ALIGNED(x) __attribute__ ((aligned(x)))
 #endif
 
 /*!
@@ -269,7 +290,7 @@ enum TypeFlag {
   kUint8 = 3,
   kInt32 = 4,
   kInt8  = 5,
-  kInt64 = 6
+  kInt64 = 6,
 };
 
 template<typename DType>
@@ -364,6 +385,11 @@ struct DataType<int32_t> {
   typedef int32_t ScaleType;
 #endif
 #endif
+};
+template<>
+struct DataType<int64_t> {
+  static const int kFlag = kInt64;
+  static const int kLanes = 1;
 };
 
 template<>
@@ -605,6 +631,7 @@ template<>
 MSHADOW_XINLINE int64_t MinValue<int64_t>(void) {
   return LLONG_MIN;
 }
+
 /*!
  * \brief maximum value of certain types
  * \tparam DType data type
@@ -620,6 +647,11 @@ MSHADOW_XINLINE float MaxValue<float>(void) {
 template<>
 MSHADOW_XINLINE double MaxValue<double>(void) {
   return DBL_MAX;
+}
+/*! \brief maximum value of half */
+template<>
+MSHADOW_XINLINE half::half_t MaxValue<half::half_t>(void) {
+  return MSHADOW_HALF_MAX;
 }
 /*! \brief maximum value of uint8_t */
 template<>
@@ -650,6 +682,14 @@ struct sum {
   MSHADOW_XINLINE static void Reduce(volatile DType& dst,  volatile DType src) { // NOLINT(*)
     dst += src;
   }
+  /*! \brief do stable reduction into dst */
+  template<typename DType>
+  MSHADOW_XINLINE static void Reduce(volatile DType& dst,  volatile DType src, volatile DType& residual) { // NOLINT(*)
+    DType y = src - residual;
+    DType t = dst + y;
+    residual = (t - dst) - y;
+    dst = t;
+  }
   /*!
    *\brief calculate gradient of redres with respect to redsrc,
    * redres: reduced result, redsrc: one of reduction element
@@ -665,6 +705,14 @@ struct sum {
   MSHADOW_XINLINE static void SetInitValue(DType &initv) { // NOLINT(*)
     initv = 0;
   }
+  /*!
+   *\brief set the initial value during reduction
+   */
+  template<typename DType>
+  MSHADOW_XINLINE static void SetInitValue(DType &initv, DType &residual) { // NOLINT(*)
+    SetInitValue(initv);
+    residual = 0;
+  }
 };
 /*! \brief maximum reducer */
 struct maximum {
@@ -678,6 +726,12 @@ struct maximum {
     dst = max(dst, src);
 #endif  // __CUDACC__
   }
+  /*! \brief do reduction into dst */
+  template<typename DType>
+  MSHADOW_XINLINE static void Reduce(volatile DType& dst,  volatile DType src, volatile DType &none) { // NOLINT(*)
+    Reduce(dst, src);
+  }
+
   /*!
    * \brief calculate gradient of redres with respect to redsrc,
    * redres: reduced result, redsrc: one of reduction element
@@ -693,6 +747,13 @@ struct maximum {
   MSHADOW_XINLINE static void SetInitValue(DType &initv) { // NOLINT(*)
     initv = limits::MinValue<DType>();
   }
+  /*!
+   *\brief set the initial value during reduction
+   */
+  template<typename DType>
+  MSHADOW_XINLINE static void SetInitValue(DType &initv, DType &none) { // NOLINT(*)
+    SetInitValue(initv);
+  }
 };
 /*! \brief minimum reducer */
 struct minimum {
@@ -705,6 +766,11 @@ struct minimum {
 #else
     dst = min(dst, src);
 #endif  // __CUDACC__
+  }
+  /*! \brief do reduction into dst */
+  template<typename DType>
+  MSHADOW_XINLINE static void Reduce(volatile DType& dst,  volatile DType src, volatile DType &none) { // NOLINT(*)
+    Reduce(dst, src);
   }
   /*!
    * \brief calculate gradient of redres with respect to redsrc,
@@ -719,7 +785,14 @@ struct minimum {
    */
   template<typename DType>
   MSHADOW_XINLINE static void SetInitValue(DType &initv) { // NOLINT(*)
-    initv = -limits::MinValue<DType>();
+    initv = limits::MaxValue<DType>();
+  }
+  /*!
+   *\brief set the initial value during reduction
+   */
+  template<typename DType>
+  MSHADOW_XINLINE static void SetInitValue(DType &initv, DType &none) { // NOLINT(*)
+    SetInitValue(initv);
   }
 };
 }  // namespace red
@@ -812,6 +885,25 @@ struct minimum {
     break;                                                \
   default:                                                \
     LOG(FATAL) << "Unknown type enum " << type;           \
+  }
+
+#define MSHADOW_SGL_DBL_TYPE_SWITCH(type, DType, ...)  \
+  switch (type) {                                      \
+  case mshadow::kFloat32:                              \
+    {                                                  \
+      typedef float DType;                             \
+      {__VA_ARGS__}                                    \
+    }                                                  \
+    break;                                             \
+  case mshadow::kFloat64:                              \
+    {                                                  \
+      typedef double DType;                            \
+      {__VA_ARGS__}                                    \
+    }                                                  \
+    break;                                             \
+  default:                                             \
+    LOG(FATAL) << "This operation only supports "      \
+                  "32-bit and 64-bit floating point";  \
   }
 
 #define MSHADOW_REAL_TYPE_SWITCH(type, DType, ...)  \
@@ -925,6 +1017,22 @@ struct minimum {
     break;                                          \
   default:                                          \
     LOG(FATAL) << "Unknown layout enum " << layout; \
+  }
+
+/*!
+ * \brief Only supports int64 index type for aux_data
+ * in NDArray class fow now.
+ */
+#define MSHADOW_IDX_TYPE_SWITCH(type, DType, ...)   \
+  switch (type) {                                   \
+  case mshadow::kInt64:                             \
+    {                                               \
+      typedef int64_t DType;                        \
+      {__VA_ARGS__}                                 \
+    }                                               \
+    break;                                          \
+  default:                                          \
+    LOG(FATAL) << "Unknown type enum " << type;     \
   }
 
 /*! \brief get data type size from type enum */

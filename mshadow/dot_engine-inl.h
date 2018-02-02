@@ -448,14 +448,9 @@ struct BLASEngine<gpu, half::half_t> {
                           const half::half_t *B, int ldb, half::half_t beta,
                           half::half_t *C, int ldc) {
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 7050
-  if (
-#if MSHADOW_USE_PASCAL == 1
-      false ||
-#endif
-      stream->dev_id == -1 || (stream->prop.major <= 5 && stream->prop.minor <= 2)) {
-    // Not PASCAL
-    float alpha_f = float(alpha);  // NOLINT(*)
-    float beta_f = float(beta);  // NOLINT(*)
+  // Always use pseudo-fp16: fp32 compute with fp16 I/O.
+  float alpha_f = float(alpha);  // NOLINT(*)
+  float beta_f = float(beta);  // NOLINT(*)
   #if CUDA_VERSION >= 8000
     cublasStatus_t err = cublasSgemmEx(Stream<gpu>::GetBlasHandle(stream),
                                        GetT(transa), GetT(transb), m, n, k, &alpha_f,
@@ -469,14 +464,6 @@ struct BLASEngine<gpu, half::half_t> {
                                        ldb, &beta_f, C, CUBLAS_DATA_HALF, ldc);
     CHECK_EQ(err, CUBLAS_STATUS_SUCCESS) << "Cublas SgemmEx fail";
   #endif  // CUDA_VERSION >= 8000
-  } else {
-    // PASCAL
-    cublasStatus_t err = cublasHgemm(Stream<gpu>::GetBlasHandle(stream),
-                                     GetT(transa), GetT(transb), m, n, k, &alpha.cuhalf_,
-                                     &A->cuhalf_, lda, &B->cuhalf_, ldb,
-                                     &beta.cuhalf_, &C->cuhalf_, ldc);
-    CHECK_EQ(err, CUBLAS_STATUS_SUCCESS) << "Cublas Hgemm fail";
-  }
 #else
     LOG(FATAL) << "Require CUDA version >= 7.5!";
 #endif  // defined(CUDA_VERSION) && CUDA_VERSION >= 7050
@@ -555,7 +542,7 @@ struct BLASEngine<gpu, float> {
                                   const float *A, int lda, const float *B, int ldb,
                                   float beta, float *C, int ldc, int batch_count,
                                   float **workspace) {
-#if defined(__CUDACC__) && CUDA_VERSION >= 4010
+#if defined(__CUDACC__) && CUDA_VERSION >= 4010 && CUDA_VERSION < 8000
     // Cast DType* to DType** using workspace as a buffer
     bool alloc_workspace = false;
     if (workspace == NULL) {
@@ -577,6 +564,14 @@ struct BLASEngine<gpu, float> {
     if (alloc_workspace) {
       cudaFree(workspace);
     }
+#elif defined(__CUDACC__) && CUDA_VERSION >= 8000
+    cublasStatus_t err = cublasSgemmStridedBatched(Stream<gpu>::GetBlasHandle(stream),
+      GetT(transa), GetT(transb), m, n, k, &alpha,
+      A, lda, m * k,
+      B, ldb, k * n,
+      &beta, C, ldc, m * n,
+      batch_count);
+    CHECK_EQ(err, CUBLAS_STATUS_SUCCESS) << "Cublas: SgemmStridedBatched fail";
 #else
     for (int i = 0; i < batch_count; ++i) {
       gemm(stream, transa, transb, m, n, k, alpha,
@@ -664,7 +659,7 @@ struct BLASEngine<gpu, double> {
                                   const double *A, int lda, const double *B, int ldb,
                                   double beta, double *C, int ldc, int batch_count,
                                   double **workspace) {
-#if defined(__CUDACC__) && CUDA_VERSION >= 4010
+#if defined(__CUDACC__) && CUDA_VERSION >= 4010 && CUDA_VERSION < 8000
     // Cast DType* to DType** using workspace as a buffer
     bool alloc_workspace = false;
     if (workspace == NULL) {
@@ -686,6 +681,14 @@ struct BLASEngine<gpu, double> {
     if (alloc_workspace) {
       cudaFree(workspace);
     }
+#elif defined(__CUDACC__) && CUDA_VERSION >= 8000
+    cublasStatus_t err = cublasDgemmStridedBatched(Stream<gpu>::GetBlasHandle(stream),
+      GetT(transa), GetT(transb), m, n, k, &alpha,
+      A, lda, m * k,
+      B, ldb, k * n,
+      &beta, C, ldc, m * n,
+      batch_count);
+    CHECK_EQ(err, CUBLAS_STATUS_SUCCESS) << "Cublas: DgemmStridedBatched fail";
 #else
     for (int i = 0; i < batch_count; ++i) {
       gemm(stream, transa, transb, m, n, k, alpha,

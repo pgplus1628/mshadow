@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <random>
 #include "./base.h"
 #include "./tensor.h"
 #include "./tensor_container.h"
@@ -79,6 +80,13 @@ class Random<cpu, DType> {
    */
   inline unsigned GetRandInt() {
     return rnd_engine_();
+  }
+
+  /*!
+   * \brief get a set of random integers
+   */
+  inline void GetRandInt(const Tensor<cpu, 1, unsigned>& dst) {
+    std::generate_n(dst.dptr_, dst.size(0), [&](){ return rnd_engine_(); });
   }
 
   /*!
@@ -257,6 +265,10 @@ class Random<cpu, DType> {
     return expr::reshape(buffer_, shape);
   }
 
+  std::mt19937 &GetRndEngine() {
+    return rnd_engine_;
+  }
+
  private:
 #if MSHADOW_IN_CXX11
   /*! \brief use c++11 random engine. */
@@ -364,17 +376,12 @@ class Random<gpu, DType> {
    * \brief constructor of random engine
    * \param seed random number seed
    */
-  explicit Random(int seed) {
-    curandStatus_t status;
-    status = curandCreateGenerator(&gen_, CURAND_RNG_PSEUDO_DEFAULT);
-    CHECK_EQ(status, CURAND_STATUS_SUCCESS) << "Can not create CURAND Generator";
+  explicit Random(int seed) : gen_(NULL) {
     this->Seed(seed);
     buffer_.Resize(Shape1(kRandBufferSize));
   }
   ~Random(void) MSHADOW_THROW_EXCEPTION {
-    curandStatus_t status;
-    status = curandDestroyGenerator(gen_);
-    CHECK_EQ(status, CURAND_STATUS_SUCCESS) << "Destory CURAND Gen failed";
+    DeleteGenerator();
   }
   /*!
    * \brief set the stream of computation
@@ -391,9 +398,20 @@ class Random<gpu, DType> {
    * \param seed seed of prng
    */
   inline void Seed(int seed) {
+    // Create a new rng, either initially or if the RNG type can't reset its offset.
+    if (gen_ == NULL || (curandSetGeneratorOffset(gen_, 0ULL) != CURAND_STATUS_SUCCESS))
+      CreateGenerator();
+    // Now set the seed.
     curandStatus_t status;
-    status = curandSetPseudoRandomGeneratorSeed(gen_, seed);
+    status = curandSetPseudoRandomGeneratorSeed(gen_, static_cast<uint64_t>(seed));
     CHECK_EQ(status, CURAND_STATUS_SUCCESS) << "Set CURAND seed failed.";
+  }
+  /*!
+   * \brief get a set of random integers
+   */
+  inline void GetRandInt(const Tensor<gpu, 1, unsigned>& dst) {
+    curandStatus_t status = curandGenerate(gen_, dst.dptr_, dst.size(0));
+    CHECK_EQ(status, CURAND_STATUS_SUCCESS) << "CURAND Gen rand ints failed.";
   }
   /*!
    * \brief generate data from uniform [a,b)
@@ -476,7 +494,22 @@ class Random<gpu, DType> {
     CHECK_EQ(status, CURAND_STATUS_SUCCESS) << "CURAND Gen Uniform double failed."
                                             << " size = " << size;
   }
-  /*! \brief random numbeer generator */
+  inline void CreateGenerator() {
+    if (gen_ != NULL)
+      DeleteGenerator();
+    curandStatus_t status;
+    status = curandCreateGenerator(&gen_, CURAND_RNG_PSEUDO_DEFAULT);
+    CHECK_EQ(status, CURAND_STATUS_SUCCESS) << "Cannot create CURAND Generator";
+  }
+  inline void DeleteGenerator() {
+    if (gen_ != NULL) {
+      curandStatus_t status;
+      status = curandDestroyGenerator(gen_);
+      CHECK_EQ(status, CURAND_STATUS_SUCCESS) << "Destory CURAND Gen failed";
+      gen_ = NULL;
+    }
+  }
+  /*! \brief random number generator */
   curandGenerator_t gen_;
   /*! \brief templ buffer */
   TensorContainer<gpu, 1, DType> buffer_;

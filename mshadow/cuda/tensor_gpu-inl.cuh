@@ -67,28 +67,28 @@ inline void CheckLaunchParam(dim3 dimGrid, dim3 dimBlock, const char *estr = "")
 template<typename Saver, typename DstPlan,
          typename Plan, int block_dim_bits>
 __device__ void MapPlanProc(DstPlan dst, index_t xstride,
-                            Shape<2> dshape, const Plan exp, int block_idx) {
+                            Shape<2> dshape, const Plan plan, int block_idx) {
   const index_t tid = (block_idx << block_dim_bits) + threadIdx.x;
   const int y = tid / xstride;
   const int x = tid % xstride;
   if (y < dshape[0] && x < dshape[1]) {
-    Saver::Save(dst.REval(y, x), exp.Eval(y,x));
+    Saver::Save(dst.REval(y, x), plan.Eval(y, x));
   }
 }
-template<typename Saver,int block_dim_bits,
+template<typename Saver, int block_dim_bits,
          typename DstPlan, typename Plan>
 __global__ void MapPlanKernel(DstPlan dst, index_t xstride,
-                              Shape<2> dshape, const Plan exp) {
+                              Shape<2> dshape, const Plan plan) {
   MapPlanProc<Saver, DstPlan, Plan, block_dim_bits>
-      (dst, xstride, dshape, exp, blockIdx.x);
+      (dst, xstride, dshape, plan, blockIdx.x);
 }
 template<typename Saver, int block_dim_bits, int grid_size,
          typename DstPlan, typename Plan>
 __global__ void MapPlanLargeKernel(DstPlan dst, index_t xstride,
-                                   Shape<2> dshape, const Plan exp, int repeat) {
+                                   Shape<2> dshape, const Plan plan, int repeat) {
   for (int i = 0; i < repeat; ++i) {
   MapPlanProc<Saver, DstPlan, Plan, block_dim_bits>
-      (dst, xstride, dshape, exp, blockIdx.x + i * grid_size);
+      (dst, xstride, dshape, plan, blockIdx.x + i * grid_size);
   }
 }
 
@@ -119,7 +119,7 @@ inline void MapPlan(expr::Plan<DstExp, DType> dst,
   }
 }
 
-template<typename Saver,typename Reducer, int warp_bits,
+template<typename Saver, typename Reducer, int warp_bits,
          typename DType, typename DstPlan, typename Plan>
 __global__ void
 __launch_bounds__(kMemUnit*kMemUnit, 1)
@@ -172,25 +172,27 @@ template<typename Saver, typename Reducer, int block_dim_bits,
 __global__ void MapReduceKeepDim1Kernel(DstPlan dst, Plan plan, DType scale, Shape<4> pshape) {
   const int block_size = 1 << block_dim_bits;
   __shared__ DType s_rec[block_size];
-  const int c = blockIdx.x;
+  const int c = blockIdx.x + blockIdx.y * gridDim.x;
   const index_t tot = pshape[3] * pshape[2] * pshape[0];
 
-  DType res; Reducer::SetInitValue(res);
-  for (index_t i_offset = 0; i_offset < tot; i_offset += block_size) {
-    index_t i = i_offset + threadIdx.x;
-    if (i< tot) {
-      const index_t x = i % pshape[3];
-      i /= pshape[3];
-      const index_t y = i % pshape[2];
-      const index_t n = i / pshape[2];
-      Reducer::Reduce(res, plan.Eval((n * pshape[1] + c) * pshape[2] + y, x));
+  if (c < pshape[1]) {
+    DType res; Reducer::SetInitValue(res);
+    for (index_t i_offset = 0; i_offset < tot; i_offset += block_size) {
+      index_t i = i_offset + threadIdx.x;
+      if (i< tot) {
+        const index_t x = i % pshape[3];
+        i /= pshape[3];
+        const index_t y = i % pshape[2];
+        const index_t n = i / pshape[2];
+        Reducer::Reduce(res, plan.Eval((n * pshape[1] + c) * pshape[2] + y, x));
+      }
     }
-  }
-  s_rec[threadIdx.x] = res;
-  __syncthreads();
-  Reduce1D<Reducer, block_dim_bits>(s_rec);
-  if (threadIdx.x == 0) {
-    Saver::Save(dst.REval(0, c), DType(s_rec[0] * scale));
+    s_rec[threadIdx.x] = res;
+    __syncthreads();
+    Reduce1D<Reducer, block_dim_bits>(s_rec);
+    if (threadIdx.x == 0) {
+      Saver::Save(dst.REval(0, c), DType(s_rec[0] * scale));
+    }
   }
 }
 
@@ -200,9 +202,12 @@ inline void MapReduceKeepDim1(expr::Plan<DstExp, DType> dst,
                               DType scale, Shape<4> pshape,
                               cudaStream_t stream) {
   dim3 dimBlock(kBaseThreadNum);
-  dim3 dimGrid (pshape[1]);
+  const int grid_dim_x = (pshape[1] > kMaxGridNum) ? kMaxGridNum : pshape[1];
+  const int grid_dim_y = (pshape[1] > kMaxGridNum) ? (pshape[1] + kMaxGridNum - 1) / kMaxGridNum
+                                                   : 1;
+  dim3 dimGrid(grid_dim_x, grid_dim_y);
   CheckLaunchParam(dimGrid, dimBlock, "MapReduceKeepDim1");
-  MapReduceKeepDim1Kernel<Saver,Reducer,kBaseThreadBits, DType,
+  MapReduceKeepDim1Kernel<Saver, Reducer, kBaseThreadBits, DType,
                           expr::Plan<DstExp, DType>,
                           expr::Plan<E, DType> >
       <<<dimGrid, dimBlock, 0, stream>>>(dst, plan, scale, pshape);
@@ -251,6 +256,28 @@ __global__ void SoftmaxGradKernel(DstPlan dst, SrcPlan1 src, SrcPlan2 label, ind
 }
 
 template<int x_bits, typename DType, typename DstPlan, typename SrcPlan1, typename SrcPlan2>
+__global__ void SmoothSoftmaxGradKernel(DstPlan dst, SrcPlan1 src, SrcPlan2 label, index_t xmax,
+                                        float alpha) {
+  const unsigned x_size = 1 << x_bits;
+  const int y = blockIdx.x;
+  const int k = static_cast<int>(label.Eval(0, y));
+  // xmax is the number of classes in our distribution
+  const float smooth_grad = (alpha / (xmax - 1));
+
+  // calculate normalizer, with writeback
+  for (unsigned x = 0; x < xmax; x += x_size) {
+    const unsigned xindex = x + threadIdx.x;
+    if (xindex < xmax) {
+      if (xindex == k) {
+        dst.REval(y, xindex) = src.Eval(y, xindex) - 1.0f + alpha;
+      } else {
+        dst.REval(y, xindex) = src.Eval(y, xindex) - smooth_grad;
+      }
+    }
+  }
+}
+
+template<int x_bits, typename DType, typename DstPlan, typename SrcPlan1, typename SrcPlan2>
 __global__ void SoftmaxGradKernel(DstPlan dst, SrcPlan1 src, SrcPlan2 label, index_t xmax,
                                   DType ignore_label) {
   const unsigned x_size = 1 << x_bits;
@@ -268,6 +295,32 @@ __global__ void SoftmaxGradKernel(DstPlan dst, SrcPlan1 src, SrcPlan2 label, ind
           dst.REval(y, xindex) = src.Eval(y, xindex) - 1.0f;
         } else {
           dst.REval(y, xindex) = src.Eval(y, xindex);
+        }
+      }
+    }
+  }
+}
+
+template<int x_bits, typename DType, typename DstPlan, typename SrcPlan1, typename SrcPlan2>
+__global__ void SmoothSoftmaxGradKernel(DstPlan dst, SrcPlan1 src, SrcPlan2 label, index_t xmax,
+                                  DType ignore_label, float alpha) {
+  const unsigned x_size = 1 << x_bits;
+  const int y = blockIdx.x;
+  const int k = static_cast<int>(label.Eval(0, y));
+  // xmax is the number of classes in our distribution
+  const float smooth_grad = (alpha / (xmax - 1));
+
+  // calculate normalizer, with writeback
+  for (unsigned x = 0; x < xmax; x += x_size) {
+    const unsigned xindex = x + threadIdx.x;
+    if (xindex < xmax) {
+      if (static_cast<int>(ignore_label) == k) {
+        dst.REval(y, xindex) = 0.0f;
+      } else {
+        if (xindex == k) {
+          dst.REval(y, xindex) = src.Eval(y, xindex) - 1.0f + alpha;
+        } else {
+          dst.REval(y, xindex) = src.Eval(y, xindex) - smooth_grad;
         }
       }
     }
@@ -324,7 +377,7 @@ __global__ void SoftmaxKernel(DstPlan dst, SrcPlan src, index_t xmax) {
 }
 
 template<typename DType>
-inline void Softmax(Tensor<gpu, 2, DType> &dst,
+inline void Softmax(const Tensor<gpu, 2, DType> &dst,
                     const Tensor<gpu, 2, DType> &src) {
   dim3 dimBlock(kBaseThreadNum);
   dim3 dimGrid(dst.size(0));
@@ -340,7 +393,7 @@ inline void Softmax(Tensor<gpu, 2, DType> &dst,
 }
 
 template<typename DType>
-inline void SoftmaxGrad(Tensor<gpu, 2, DType> &dst,
+inline void SoftmaxGrad(const Tensor<gpu, 2, DType> &dst,
                         const Tensor<gpu, 2, DType> &src,
                         const Tensor<gpu, 1, DType> &label) {
   dim3 dimBlock(kBaseThreadNum);
@@ -359,7 +412,28 @@ inline void SoftmaxGrad(Tensor<gpu, 2, DType> &dst,
 }
 
 template<typename DType>
-inline void SoftmaxGrad(Tensor<gpu, 2, DType> &dst,
+inline void SmoothSoftmaxGrad(const Tensor<gpu, 2, DType> &dst,
+                              const Tensor<gpu, 2, DType> &src,
+                              const Tensor<gpu, 1, DType> &label,
+                              const float alpha) {
+  dim3 dimBlock(kBaseThreadNum);
+  dim3 dimGrid(dst.size(0));
+  CHECK_EQ(dst.shape_, src.shape_) << "SoftmaxGrad: shape mismatch";
+  CHECK_EQ(dst.size(0), label.size(0)) << "SoftmaxGrad: label shape mismatch";
+  CheckLaunchParam(dimGrid, dimBlock, "SoftmaxGrad");
+  cudaStream_t stream = Stream<gpu>::GetStream(dst.stream_);
+  SmoothSoftmaxGradKernel<kBaseThreadBits, DType>
+      <<<dimGrid, dimBlock, 0, stream>>>
+      (expr::MakePlan(dst),
+       expr::MakePlan(src),
+       expr::MakePlan(label),
+       dst.size(1),
+       alpha);
+  MSHADOW_CUDA_POST_KERNEL_CHECK(SoftmaxGradKernel);
+}
+
+template<typename DType>
+inline void SoftmaxGrad(const Tensor<gpu, 2, DType> &dst,
                         const Tensor<gpu, 2, DType> &src,
                         const Tensor<gpu, 1, DType> &label,
                         const DType &ignore_label) {
@@ -376,6 +450,29 @@ inline void SoftmaxGrad(Tensor<gpu, 2, DType> &dst,
        expr::MakePlan(label),
        dst.size(1),
        ignore_label);
+  MSHADOW_CUDA_POST_KERNEL_CHECK(SoftmaxGradKernel);
+}
+
+template<typename DType>
+inline void SmoothSoftmaxGrad(const Tensor<gpu, 2, DType> &dst,
+                              const Tensor<gpu, 2, DType> &src,
+                              const Tensor<gpu, 1, DType> &label,
+                              const DType &ignore_label,
+                              const float alpha) {
+  dim3 dimBlock(kBaseThreadNum);
+  dim3 dimGrid(dst.size(0));
+  CHECK_EQ(dst.shape_, src.shape_) << "SoftmaxGrad: shape mismatch";
+  CHECK_EQ(dst.size(0), label.size(0)) << "SoftmaxGrad: label shape mismatch";
+  CheckLaunchParam(dimGrid, dimBlock, "SoftmaxGrad");
+  cudaStream_t stream = Stream<gpu>::GetStream(dst.stream_);
+  SmoothSoftmaxGradKernel<kBaseThreadBits, DType>
+      <<<dimGrid, dimBlock, 0, stream>>>
+      (expr::MakePlan(dst),
+       expr::MakePlan(src),
+       expr::MakePlan(label),
+       dst.size(1),
+       ignore_label,
+       alpha);
   MSHADOW_CUDA_POST_KERNEL_CHECK(SoftmaxGradKernel);
 }
 
@@ -441,7 +538,7 @@ __global__ void Softmax3DKernel(Tensor<gpu, 3, DType> dst,
   for (index_t n_index = n; n_index < nmax; n_index += n_size) {
     DType smax = src[y][0][n_index];
     for (index_t i = 1; i < xmax; ++i) {
-      smax = max(smax, src[y][i][n_index]);
+      smax = max(smax, src[y][i][n_index]);  // NOLINT(*)
     }
     DType ssum = 0.0f;
     for (index_t i = 0; i < xmax; ++i) {
@@ -456,7 +553,7 @@ __global__ void Softmax3DKernel(Tensor<gpu, 3, DType> dst,
 }
 
 template<typename DType>
-inline void Softmax(Tensor<gpu, 3, DType> &dst,
+inline void Softmax(const Tensor<gpu, 3, DType> &dst,
                     const Tensor<gpu, 3, DType> &src) {
   dim3 dimBlock(kBaseThreadNum);
   dim3 dimGrid(dst.size(0));
@@ -468,7 +565,7 @@ inline void Softmax(Tensor<gpu, 3, DType> &dst,
 }
 
 template<typename DType>
-inline void SoftmaxGrad(Tensor<gpu, 3, DType> &dst,
+inline void SoftmaxGrad(const Tensor<gpu, 3, DType> &dst,
                         const Tensor<gpu, 3, DType> &src,
                         const Tensor<gpu, 2, DType> &label) {
   dim3 dimBlock(kBaseThreadNum);
@@ -483,7 +580,7 @@ inline void SoftmaxGrad(Tensor<gpu, 3, DType> &dst,
 }
 
 template<typename DType>
-inline void SoftmaxGrad(Tensor<gpu, 3, DType> &dst,
+inline void SoftmaxGrad(const Tensor<gpu, 3, DType> &dst,
                         const Tensor<gpu, 3, DType> &src,
                         const Tensor<gpu, 2, DType> &label,
                         const DType &ignore_label) {
@@ -494,7 +591,8 @@ inline void SoftmaxGrad(Tensor<gpu, 3, DType> &dst,
   CHECK_EQ(dst.size(2), label.size(1)) << "SoftmaxGrad: label shape mismatch";
   CheckLaunchParam(dimGrid, dimBlock, "SoftmaxGrad");
   cudaStream_t stream = Stream<gpu>::GetStream(dst.stream_);
-  Softmax3DGradKernel<kBaseThreadBits, DType><<<dimGrid, dimBlock, 0, stream>>>(dst, src, label, ignore_label);
+  Softmax3DGradKernel<kBaseThreadBits, DType><<<dimGrid, dimBlock, 0, stream>>>(
+    dst, src, label, ignore_label);
   MSHADOW_CUDA_POST_KERNEL_CHECK(Softmax3DGradKernel);
 }
 
@@ -520,7 +618,8 @@ __global__ void AddTakeGradKernel(DstPlan dst,
 
 template<int warp_bits, int SZ, typename DType, typename IdxType>
 __global__ void AddTakeGradLargeBatchKernel(DType* dst,
-                                            const IdxType *sorted, const IdxType *index, const DType *src,
+                                            const IdxType *sorted, const IdxType *index,
+                                            const DType *src,
                                             int ymax, int xmax) {
   // Based on Torch's Version https://github.com/torch/cunn/blob/master/lib/THCUNN/LookupTable.cu
   // Each warp is responsible for an input into the LookupTable.
@@ -547,11 +646,9 @@ __global__ void AddTakeGradLargeBatchKernel(DType* dst,
       float grad_out[SZ];
       float grad_weight[SZ];
       #pragma unroll
-      for (int ii = 0; ii < SZ; ii++)
-      {
+      for (int ii = 0; ii < SZ; ii++) {
         int feature_dim = start_feature + ii * warp_size;
-        if (feature_dim < xmax)
-        {
+        if (feature_dim < xmax) {
           grad_out[ii] = src[src_row + feature_dim];
           grad_weight[ii] = dst[dst_row + feature_dim];
         }
@@ -637,14 +734,17 @@ inline void AddTakeGradLargeBatch(Tensor<gpu, 2, DType> dst,
 
 template<int warp_bits, typename DType, typename DstPlan, typename IndexPlan, typename SrcPlan>
 __global__ void IndexFillKernel(DstPlan dst,
-                                IndexPlan index, SrcPlan src,
-                                index_t ymax, int xmax) {
-  int src_idx = blockIdx.x * blockDim.y + threadIdx.y;
-  if (src_idx < ymax) {
-    int dst_idx = static_cast<int>(index.Eval(0, src_idx));
-    for (int i = threadIdx.x; i < xmax; i += blockDim.x) {
-      dst.REval(dst_idx, i) = src.Eval(src_idx, i);
-    }
+                                const IndexPlan index,
+                                const SrcPlan src,
+                                const int ymax,
+                                const int xmax) {
+  int bid = blockIdx.y * blockDim.x + blockIdx.x;
+  int tid = bid * blockDim.x * blockDim.y + threadIdx.y * blockDim.x + threadIdx.x;
+  if (tid < ymax * xmax) {
+    int i = tid / xmax;
+    int j = tid % xmax;
+    int k = static_cast<int>(index.Eval(0, i));
+    dst.REval(k, j) = src.Eval(i, j);
   }
 }
 
@@ -659,9 +759,15 @@ inline void IndexFill(Tensor<gpu, 2, DType> dst,
   CHECK_EQ(index.size(0), src.size(0)) << "IndexFill: shape mismatch";
   const int block_dim_x = 1 << kMemUnitBits;
   const int block_dim_y = 1 << kMemUnitBits;
-  const int grid_dim_x = (src.size(0) + block_dim_y - 1) / block_dim_y;
+  const int block_size = block_dim_x * block_dim_y;
+  int grid_dim_x = (src.size(0) * src.size(1) + block_size - 1) / block_size;
+  int grid_dim_y = 1;
+  while (grid_dim_x > kMaxGridDim) {
+    grid_dim_x = (grid_dim_x + 1) / 2;
+    grid_dim_y *= 2;
+  }
   dim3 dimBlock(block_dim_x, block_dim_y);
-  dim3 dimGrid(grid_dim_x);
+  dim3 dimGrid(grid_dim_x, grid_dim_y);
   CheckLaunchParam(dimGrid, dimBlock, "IndexFill");
   cudaStream_t stream = Stream<gpu>::GetStream(dst.stream_);
 
@@ -687,11 +793,11 @@ inline void SortByKey(Tensor<gpu, 1, KDType> keys, Tensor<gpu, 1, VDType> values
   if (is_ascend) {
     thrust::stable_sort_by_key(
       thrust::cuda::par.on(stream),
-      key_iter, key_iter + keys.size(0), value_iter, thrust::less<KDType>());
+      key_iter, key_iter + keys.size(0), value_iter, thrust::less<KDType>());  // NOLINT(*)
   } else {
     thrust::stable_sort_by_key(
       thrust::cuda::par.on(stream),
-      key_iter, key_iter + keys.size(0), value_iter, thrust::greater<KDType>());
+      key_iter, key_iter + keys.size(0), value_iter, thrust::greater<KDType>());  // NOLINT(*)
   }
   MSHADOW_CUDA_POST_KERNEL_CHECK(SortByKey);
 #else
@@ -707,6 +813,13 @@ inline void SortByKey(Tensor<gpu, 1, mshadow::half::half_t> keys, Tensor<gpu, 1,
 
 template<typename DType>
 inline void SortByKey(Tensor<gpu, 1, DType> keys, Tensor<gpu, 1, mshadow::half::half_t> values,
+  bool is_ascend) {
+  LOG(FATAL) << "SortByKey for half_t is not implemented!";
+}
+
+// break ambiguous template deduction for <half_t, half_t>
+inline void SortByKey(Tensor<gpu, 1, mshadow::half::half_t> keys,
+  Tensor<gpu, 1, mshadow::half::half_t> values,
   bool is_ascend) {
   LOG(FATAL) << "SortByKey for half_t is not implemented!";
 }

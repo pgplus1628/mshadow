@@ -16,7 +16,11 @@
     /*! \brief __half2float_warp */
     __host__ __device__ float __half2float_warp(const volatile __half& h) { /* NOLINT(*) */
       __half val;
+#if CUDA_VERSION >= 9000
+      val = const_cast<__half&>(h);
+#else
       val.x = h.x;
+#endif
       return __half2float(val);
     }
   #endif
@@ -69,7 +73,7 @@ namespace half {
   }
 #endif  // (MSHADOW_CUDA_HALF && defined(__CUDA_ARCH__))
 
-class half_t {
+class MSHADOW_ALIGNED(2) half_t {
  public:
   union {
     uint16_t half_;
@@ -263,8 +267,8 @@ MSHADOW_HALF_OPERATOR(bool, >=)
 /*! \brief overloaded <= operator for half_t */
 MSHADOW_HALF_OPERATOR(bool, <=)
 
-#define MSHADOW_HALF_MIN mshadow::half::half_t::Binary(0x0400);
+#define MSHADOW_HALF_MIN mshadow::half::half_t::Binary(0xFBFF);
+#define MSHADOW_HALF_MAX mshadow::half::half_t::Binary(0x7BFF);
 }  // namespace half
 }  // namespace mshadow
 #endif  // MSHADOW_HALF_H_
-
